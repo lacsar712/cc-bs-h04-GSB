@@ -54,7 +54,7 @@ async function loadReadings() {
   if (!state.token) return;
   try {
     const data = await api("/api/readings");
-    state.rows = [...data].reverse(); /* h04-trap-reverse */
+    state.rows = data;
     state.error = "";
   } catch {
     state.error = "加载列表失败，请重新登录";

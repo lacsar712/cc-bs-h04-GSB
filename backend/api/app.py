@@ -7,6 +7,7 @@ from sanic import Sanic
 from sanic.response import json as sanic_json
 
 from db import create_pool, ensure_schema, seed_if_empty
+from h04_extra_trap import decorate_list, order_clause
 
 SECRET = os.environ.get("JWT_SECRET", "bridge-strain-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -99,11 +100,11 @@ async def list_readings(request):
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT id, span_code, microstrain, verdict, reason, status,
                        created_by, created_at, processed_at
                 FROM strain_readings
-                ORDER BY id ASC
+                {order_clause()}
                 """
             )
             rows = await cur.fetchall()
@@ -122,7 +123,6 @@ async def list_readings(request):
                 "processed_at": _iso(r["processed_at"]),
             }
         )
-    from h04_extra_trap import decorate_list
     return sanic_json(decorate_list(out))
 
 
