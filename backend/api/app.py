@@ -7,6 +7,7 @@ from sanic import Sanic
 from sanic.response import json as sanic_json
 
 from db import create_pool, ensure_schema, seed_if_empty
+from ordering import LIST_ORDER_SQL, ROW_COLUMNS
 
 SECRET = os.environ.get("JWT_SECRET", "bridge-strain-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -50,6 +51,20 @@ def _iso(dt) -> str | None:
     if dt is None:
         return None
     return dt.isoformat()
+
+
+def _serialize_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "span_code": r["span_code"],
+        "microstrain": r["microstrain"],
+        "verdict": r["verdict"],
+        "reason": r["reason"],
+        "status": r["status"],
+        "created_by": r["created_by"],
+        "created_at": _iso(r["created_at"]),
+        "processed_at": _iso(r["processed_at"]),
+    }
 
 
 @app.before_server_start
@@ -99,31 +114,41 @@ async def list_readings(request):
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                """
-                SELECT id, span_code, microstrain, verdict, reason, status,
-                       created_by, created_at, processed_at
+                f"""
+                SELECT {ROW_COLUMNS}
                 FROM strain_readings
-                ORDER BY id ASC
+                {LIST_ORDER_SQL}
                 """
             )
             rows = await cur.fetchall()
-    out = []
-    for r in rows:
-        out.append(
-            {
-                "id": r["id"],
-                "span_code": r["span_code"],
-                "microstrain": r["microstrain"],
-                "verdict": r["verdict"],
-                "reason": r["reason"],
-                "status": r["status"],
-                "created_by": r["created_by"],
-                "created_at": _iso(r["created_at"]),
-                "processed_at": _iso(r["processed_at"]),
-            }
-        )
-    from h04_extra_trap import decorate_list
-    return sanic_json(decorate_list(out))
+    return sanic_json([_serialize_row(r) for r in rows])
+
+
+@app.get("/api/readings/latest")
+async def latest_reading(request):
+    """按跨段编号取最近一条，与列表顶序同一口径（id 最大即最近）。"""
+    if not _require_user(request):
+        return sanic_json({"detail": "未登录"}, status=401)
+    span_code = str(request.args.get("span_code", "")).strip()
+    if not span_code:
+        return sanic_json({"detail": "跨段编号不能为空"}, status=400)
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT {ROW_COLUMNS}
+                FROM strain_readings
+                WHERE span_code = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (span_code,),
+            )
+            row = await cur.fetchone()
+    if not row:
+        return sanic_json(None)
+    return sanic_json(_serialize_row(row))
 
 
 @app.post("/api/readings")
@@ -155,20 +180,23 @@ async def create_reading(request):
                 (span_code, microstrain, user["username"]),
             )
             row = await cur.fetchone()
-        await conn.commit()
+            # 先提交入队，再以与列表完全相同的口径回查同跨最近；
+            # 不得出现一边已入队、另一边仍摸到更早编号的情况。
+            await conn.commit()
+            await cur.execute(
+                f"""
+                SELECT {ROW_COLUMNS}
+                FROM strain_readings
+                WHERE span_code = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (span_code,),
+            )
+            latest = await cur.fetchone()
 
-    return sanic_json(
-        {
-            "id": row["id"],
-            "span_code": row["span_code"],
-            "microstrain": row["microstrain"],
-            "verdict": row["verdict"],
-            "reason": row["reason"],
-            "status": row["status"],
-            "created_by": row["created_by"],
-            "created_at": _iso(row["created_at"]),
-            "processed_at": None,
-            "message": "已入队，后台工人将认领并判定",
-        },
-        status=201,
-    )
+    payload = _serialize_row(row)
+    payload["processed_at"] = None
+    payload["latest_same_span"] = _serialize_row(latest) if latest else None
+    payload["message"] = "已入队，后台工人将认领并判定"
+    return sanic_json(payload, status=201)

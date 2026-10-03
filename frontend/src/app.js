@@ -46,18 +46,39 @@ async function api(path, opts = {}) {
   } catch {
     data = { detail: text };
   }
-  if (!res.ok) throw new Error(data.detail || res.statusText);
+  if (!res.ok) {
+    const err = new Error(data.detail || res.statusText);
+    err.status = res.status;
+    throw err;
+  }
   return data;
+}
+
+function forceLogout() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  state.token = "";
+  state.user = null;
+  state.rows = [];
+  if (state.timer) clearInterval(state.timer);
+  state.timer = null;
+  m.redraw();
 }
 
 async function loadReadings() {
   if (!state.token) return;
   try {
     const data = await api("/api/readings");
-    state.rows = [...data].reverse(); /* h04-trap-reverse */
+    // 顺序完全以服务端为准（最新在顶），页面不得自行倒排。
+    state.rows = Array.isArray(data) ? data : [];
     state.error = "";
-  } catch {
-    state.error = "加载列表失败，请重新登录";
+  } catch (err) {
+    // 只有鉴权失效才退回登录页；网络抖动或后台故障保留登录态与现有列表，可继续操作。
+    if (err.status === 401) {
+      forceLogout();
+      return;
+    }
+    state.error = "列表暂时加载失败，将自动重试，无需重新登录";
   }
   m.redraw();
 }
@@ -167,15 +188,7 @@ const App = {
             "button.secondary",
             {
               type: "button",
-              onclick: () => {
-                localStorage.removeItem(TOKEN_KEY);
-                localStorage.removeItem(USER_KEY);
-                state.token = "";
-                state.user = null;
-                state.rows = [];
-                if (state.timer) clearInterval(state.timer);
-                m.redraw();
-              },
+              onclick: () => forceLogout(),
             },
             "退出"
           ),
@@ -204,6 +217,10 @@ const App = {
                     state.submitForm = { span_code: "", microstrain: "" };
                     await loadReadings();
                   } catch (err) {
+                    if (err.status === 401) {
+                      forceLogout();
+                      return;
+                    }
                     state.error = err.message || "提交失败";
                   } finally {
                     state.loading = false;
